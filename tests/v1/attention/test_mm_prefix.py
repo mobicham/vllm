@@ -187,6 +187,21 @@ def test_returns_none_when_no_range_covers_a_query_token():
     assert _query_ranges({0: [(1, 3)]}, query_lens=[1], seq_lens=[9]) is None
 
 
+def test_decode_phase_hint_skips_ranges_without_assuming_order():
+    """Decode rows must skip prompt-only ranges before scanning them."""
+    out = np.full((STAGING_CAPACITY, 2), 12345, dtype=np.int32)
+    num_tokens = fill_mm_prefix_query_ranges(
+        out,
+        {0: [(100, 110), (0, 3)], 1: [(0, 2)]},
+        torch.tensor([0, 1, 2], dtype=torch.int32),
+        torch.tensor([201, 51], dtype=torch.int32),
+        torch.tensor([False, False]),
+    )
+
+    assert num_tokens == 0
+    np.testing.assert_array_equal(out, np.full_like(out, 12345))
+
+
 # --------------------------------------------------------------------------- #
 # FA4 kernel
 # --------------------------------------------------------------------------- #

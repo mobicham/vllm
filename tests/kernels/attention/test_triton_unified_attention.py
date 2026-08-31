@@ -291,6 +291,7 @@ def test_triton_unified_attn_clamped_mm_matches_dense_reference() -> None:
         [[[32, 351]], [[160, 287]]], dtype=torch.int32, device=DEVICE_TYPE
     )
     actual = torch.empty_like(query)
+    actual_direct = torch.empty_like(query)
 
     unified_attention(
         q=query,
@@ -310,6 +311,40 @@ def test_triton_unified_attn_clamped_mm_matches_dense_reference() -> None:
         k_descale=None,
         v_descale=None,
         mm_prefix_range=mm_prefix_range,
+        chunk_lookback=chunk_lookback,
+        mm_prefix_clamp_sliding_window=True,
+    )
+
+    # Same exact mask represented as one [start, end] range per scheduled
+    # query token. Rows outside image ranges use the (-1, -1) sentinel.
+    mm_prefix_query_range = torch.full(
+        (sum(query_lens), 2), -1, dtype=torch.int32, device=DEVICE_TYPE
+    )
+    mm_prefix_query_range[32:352] = torch.tensor(
+        [32, 351], dtype=torch.int32, device=DEVICE_TYPE
+    )
+    second_start = query_lens[0]
+    mm_prefix_query_range[second_start : second_start + 64] = torch.tensor(
+        [160, 287], dtype=torch.int32, device=DEVICE_TYPE
+    )
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=actual_direct,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max(query_lens),
+        seqused_k=kv_lens,
+        max_seqlen_k=max(kv_lens_list),
+        softmax_scale=scale,
+        causal=True,
+        window_size=(sliding_window - 1, 0),
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        mm_prefix_query_range=mm_prefix_query_range,
         chunk_lookback=chunk_lookback,
         mm_prefix_clamp_sliding_window=True,
     )
@@ -340,7 +375,91 @@ def test_triton_unified_attn_clamped_mm_matches_dense_reference() -> None:
     )
 
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        actual_direct.float(), expected.float(), atol=2e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        actual_direct.float(), actual.float(), atol=1e-5, rtol=1e-5
+    )
     assert not torch.allclose(expected, chunk_only, atol=2e-2, rtol=2e-2)
+
+
+@torch.inference_mode()
+def test_triton_direct_ranges_60_match_legacy_and_dense() -> None:
+    set_random_seed(1)
+    query_lens = [1024]
+    kv_lens_list = [1024]
+    mm_ranges = [[(8 + i * 16, 8 + i * 16 + 9) for i in range(60)]]
+    sliding_window = 128
+    block_size = 16
+    num_query_heads = 4
+    num_kv_heads = 2
+    head_size = 128
+    scale = head_size**-0.5
+
+    query = torch.randn(
+        1024, num_query_heads, head_size, dtype=torch.bfloat16, device=DEVICE_TYPE
+    )
+    num_blocks = kv_lens_list[0] // block_size
+    key_cache = torch.randn(
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_size,
+        dtype=torch.bfloat16,
+        device=DEVICE_TYPE,
+    )
+    value_cache = torch.randn_like(key_cache)
+    block_tables = torch.arange(num_blocks, dtype=torch.int32, device=DEVICE_TYPE)[
+        None, :
+    ]
+    cu_seqlens_q = torch.tensor([0, 1024], dtype=torch.int32, device=DEVICE_TYPE)
+    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device=DEVICE_TYPE)
+    legacy_ranges = torch.tensor(mm_ranges, dtype=torch.int32, device=DEVICE_TYPE)
+    direct_ranges = torch.full((1024, 2), -1, dtype=torch.int32, device=DEVICE_TYPE)
+    for start, end in mm_ranges[0]:
+        direct_ranges[start : end + 1] = torch.tensor(
+            [start, end], dtype=torch.int32, device=DEVICE_TYPE
+        )
+
+    common = dict(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=1024,
+        seqused_k=kv_lens,
+        max_seqlen_k=1024,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(sliding_window - 1, 0),
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        chunk_lookback=0,
+        mm_prefix_clamp_sliding_window=True,
+    )
+    legacy = torch.empty_like(query)
+    direct = torch.empty_like(query)
+    unified_attention(out=legacy, mm_prefix_range=legacy_ranges, **common)
+    unified_attention(out=direct, mm_prefix_query_range=direct_ranges, **common)
+    expected = ref_paged_clamped_mm_attn(
+        query,
+        key_cache,
+        value_cache,
+        query_lens,
+        kv_lens_list,
+        block_tables,
+        mm_ranges,
+        scale,
+        sliding_window,
+        0,
+    )
+    torch.testing.assert_close(legacy.float(), expected.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(direct.float(), expected.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(direct.float(), legacy.float(), atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize(

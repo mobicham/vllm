@@ -5,6 +5,7 @@
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
+import numpy as np
 import torch
 
 import vllm.envs as envs
@@ -19,7 +20,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import next_power_of_2
-from vllm.utils.torch_utils import get_dtype_size, is_quantized_kv_cache
+from vllm.utils.torch_utils import PIN_MEMORY, get_dtype_size, is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -32,6 +33,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import (
     compute_mm_prefix_range_tensor,
+    fill_mm_prefix_query_ranges,
     get_kv_cache_layout,
     get_num_attention_heads_from_layers,
 )
@@ -94,6 +96,7 @@ class TritonAttentionMetadata:
     prefix_scheduler_metadata: torch.Tensor | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     mm_prefix_range_tensor: torch.Tensor | None = None
+    mm_prefix_query_range_tensor: torch.Tensor | None = None
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
 
@@ -113,6 +116,11 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
 
         self.block_size = kv_cache_spec.block_size
+        # Only the bespoke INT4 kernel still consumes the padded per-request
+        # range list. All other Triton kernels use the direct per-query form.
+        self.use_legacy_mm_ranges = (
+            kv_cache_spec.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
+        )
 
         model_config = vllm_config.model_config
         # Compatible with models with non-uniform per-layer head counts.
@@ -184,6 +192,22 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 device=device,
             )
 
+        # Persistent CPU staging and GPU buffers indexed by scheduled query
+        # token. This removes the O(num_image_ranges) search from every Triton
+        # attention tile.
+        self.mm_prefix_query_ranges_cpu: torch.Tensor | None = None
+        self.mm_prefix_query_ranges_np: np.ndarray | None = None
+        self.mm_prefix_query_ranges_gpu: torch.Tensor | None = None
+        if model_config.is_mm_prefix_lm:
+            max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            self.mm_prefix_query_ranges_cpu = torch.empty(
+                (max_num_tokens, 2), dtype=torch.int32, pin_memory=PIN_MEMORY
+            )
+            self.mm_prefix_query_ranges_np = self.mm_prefix_query_ranges_cpu.numpy()
+            self.mm_prefix_query_ranges_gpu = torch.empty(
+                (max_num_tokens, 2), dtype=torch.int32, device=self.device
+            )
+
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> TritonAttentionMetadata:
@@ -252,9 +276,32 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         mm_ranges = common_attn_metadata.mm_req_doc_ranges
         if mm_ranges is not None:
             attn_metadata.mm_prefix_range = mm_ranges
-            attn_metadata.mm_prefix_range_tensor = compute_mm_prefix_range_tensor(
-                mm_ranges, num_reqs, seq_lens.device
-            )
+            # Avoid constructing and copying the padded (requests, ranges, 2)
+            # tensor on the normal FP8/BF16 path. Only INT4 still needs it.
+            if self.use_legacy_mm_ranges:
+                attn_metadata.mm_prefix_range_tensor = compute_mm_prefix_range_tensor(
+                    mm_ranges, num_reqs, seq_lens.device
+                )
+            if self.mm_prefix_query_ranges_np is not None:
+                assert common_attn_metadata.seq_lens_cpu_upper_bound is not None, (
+                    "mm_prefix requires seq_lens_cpu_upper_bound"
+                )
+                num_mm_tokens = fill_mm_prefix_query_ranges(
+                    self.mm_prefix_query_ranges_np,
+                    mm_ranges,
+                    common_attn_metadata.query_start_loc_cpu,
+                    common_attn_metadata.seq_lens_cpu_upper_bound,
+                    common_attn_metadata.is_prefilling,
+                )
+                if num_mm_tokens > 0:
+                    assert self.mm_prefix_query_ranges_cpu is not None
+                    assert self.mm_prefix_query_ranges_gpu is not None
+                    mm_query_ranges = self.mm_prefix_query_ranges_gpu[:num_mm_tokens]
+                    mm_query_ranges.copy_(
+                        self.mm_prefix_query_ranges_cpu[:num_mm_tokens],
+                        non_blocking=True,
+                    )
+                    attn_metadata.mm_prefix_query_range_tensor = mm_query_ranges
 
         rswa_prefix_lens = common_attn_metadata.rswa_prefix_lens
         if self.rswa_window is not None and rswa_prefix_lens is not None:
@@ -706,6 +753,13 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+        mm_prefix_query_range_tensor = attn_metadata.mm_prefix_query_range_tensor
+        # The core Triton kernel uses direct per-query ranges for all modes
+        # except the bespoke INT4 kernel. A None query tensor means no
+        # scheduled query is inside an image range, so pure decode skips
+        # multimodal range handling entirely.
+        if self._kv_quant_mode != KVQuantMode.INT4_PER_TOKEN_HEAD:
+            mm_prefix_range_tensor = None
 
         unified_attention(
             q=query[:num_actual_tokens],
@@ -734,6 +788,7 @@ class TritonAttentionImpl(AttentionImpl):
             sinks=self.sinks,
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
+            mm_prefix_query_range=mm_prefix_query_range_tensor,
             rswa_prefix_lens=attn_metadata.rswa_prefix_lens,
             rswa_window=attn_metadata.rswa_window,
             kv_quant_mode=self._kv_quant_mode,

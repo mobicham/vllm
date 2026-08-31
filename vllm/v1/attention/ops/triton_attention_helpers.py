@@ -162,6 +162,9 @@ def compute_tile_loop_bounds(
     MAX_MM_RANGES: tl.constexpr = 0,
     mm_prefix_range_ptr=None,
     seq_idx=0,
+    USE_MM_QUERY_RANGE: tl.constexpr = False,
+    mm_prefix_query_range_ptr=None,
+    query_start_idx=0,
 ):
     """Compute the tile-loop bounds ``(loop_lo, loop_hi)`` and the
     derived ``max_seq_prefix_len`` used for per-tile masking.
@@ -234,35 +237,59 @@ def compute_tile_loop_bounds(
         else:
             last_allowed_key = context_len + qpos_hi
         if USE_MM_PREFIX and MM_PREFIX_CLAMP_SW:
-            query_abs_lo = context_len + qpos_lo
-            query_abs_hi = context_len + qpos_hi
-            for i in range(MAX_MM_RANGES):
+            if USE_MM_QUERY_RANGE:
+                q_offsets = tl.arange(0, BLOCK_Q)
+                q_valid = q_offsets <= (qpos_hi - qpos_lo)
+                query_token_offsets = query_start_idx + qpos_lo + q_offsets
                 range_start = tl.load(
-                    mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2
+                    mm_prefix_query_range_ptr + query_token_offsets * 2,
+                    mask=q_valid,
+                    other=-1,
                 )
                 range_end = tl.load(
-                    mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2 + 1
+                    mm_prefix_query_range_ptr + query_token_offsets * 2 + 1,
+                    mask=q_valid,
+                    other=-1,
                 )
-                intersects_query_block = (
-                    (range_start < range_end)
-                    & (range_start <= query_abs_hi)
-                    & (range_end >= query_abs_lo)
+                is_valid = q_valid & (range_start < range_end)
+                query_abs_pos = context_len + qpos_lo + q_offsets
+                mm_first_allowed = tl.maximum(
+                    range_start, query_abs_pos - SLIDING_WINDOW + 1
                 )
-                mm_first_allowed_key = tl.maximum(
-                    range_start, query_abs_lo - SLIDING_WINDOW + 1
-                )
-                first_allowed_key = tl.minimum(
-                    first_allowed_key,
-                    tl.where(
-                        intersects_query_block,
-                        mm_first_allowed_key,
+                block_first = tl.min(tl.where(is_valid, mm_first_allowed, seq_len))
+                block_last = tl.max(tl.where(is_valid, range_end, -1))
+                first_allowed_key = tl.minimum(first_allowed_key, block_first)
+                last_allowed_key = tl.maximum(last_allowed_key, block_last)
+            else:
+                query_abs_lo = context_len + qpos_lo
+                query_abs_hi = context_len + qpos_hi
+                for i in range(MAX_MM_RANGES):
+                    range_start = tl.load(
+                        mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2
+                    )
+                    range_end = tl.load(
+                        mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2 + 1
+                    )
+                    intersects_query_block = (
+                        (range_start < range_end)
+                        & (range_start <= query_abs_hi)
+                        & (range_end >= query_abs_lo)
+                    )
+                    mm_first_allowed_key = tl.maximum(
+                        range_start, query_abs_lo - SLIDING_WINDOW + 1
+                    )
+                    first_allowed_key = tl.minimum(
                         first_allowed_key,
-                    ),
-                )
-                last_allowed_key = tl.maximum(
-                    last_allowed_key,
-                    tl.where(intersects_query_block, range_end, last_allowed_key),
-                )
+                        tl.where(
+                            intersects_query_block,
+                            mm_first_allowed_key,
+                            first_allowed_key,
+                        ),
+                    )
+                    last_allowed_key = tl.maximum(
+                        last_allowed_key,
+                        tl.where(intersects_query_block, range_end, last_allowed_key),
+                    )
         last_allowed_key = tl.minimum(last_allowed_key, seq_len - 1)
         # Convert to tile indices and clamp
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
@@ -327,6 +354,10 @@ def compute_kv_seq_mask(
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
+    USE_MM_QUERY_RANGE: tl.constexpr = False,
+    mm_prefix_query_range_ptr=None,
+    query_token_offset=0,
+    query_token_mask=True,
 ):
     """Build the KV mask for one tile.
 
@@ -392,26 +423,50 @@ def compute_kv_seq_mask(
     # kv > q - sw; future kv passes trivially). Inert for full-attention layers
     # (SLIDING_WINDOW <= 0).
     if USE_MM_PREFIX:
-        for i in range(MAX_MM_RANGES):
+        if USE_MM_QUERY_RANGE:
             range_start = tl.load(
-                mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2
+                mm_prefix_query_range_ptr + query_token_offset * 2,
+                mask=query_token_mask,
+                other=-1,
             )
             range_end = tl.load(
-                mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2 + 1
+                mm_prefix_query_range_ptr + query_token_offset * 2 + 1,
+                mask=query_token_mask,
+                other=-1,
             )
-            is_valid = range_start < range_end
-            q_in_range = (
-                (query_abs_pos >= range_start) & (query_abs_pos <= range_end) & is_valid
-            )
+            is_valid = query_token_mask & (range_start < range_end)
             k_in_range = (
-                (seq_offset[None, :] >= range_start)
-                & (seq_offset[None, :] <= range_end)
-                & is_valid
+                (seq_offset[None, :] >= range_start[:, None])
+                & (seq_offset[None, :] <= range_end[:, None])
+                & is_valid[:, None]
             )
-            mm_mask = q_in_range & k_in_range
+            mm_mask = k_in_range
             if MM_PREFIX_CLAMP_SW and SLIDING_WINDOW > 0:
                 mm_mask = mm_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
             seq_mask |= mm_mask
+        else:
+            for i in range(MAX_MM_RANGES):
+                range_start = tl.load(
+                    mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2
+                )
+                range_end = tl.load(
+                    mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2 + 1
+                )
+                is_valid = range_start < range_end
+                q_in_range = (
+                    (query_abs_pos >= range_start)
+                    & (query_abs_pos <= range_end)
+                    & is_valid
+                )
+                k_in_range = (
+                    (seq_offset[None, :] >= range_start)
+                    & (seq_offset[None, :] <= range_end)
+                    & is_valid
+                )
+                mm_mask = q_in_range & k_in_range
+                if MM_PREFIX_CLAMP_SW and SLIDING_WINDOW > 0:
+                    mm_mask = mm_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
+                seq_mask |= mm_mask
     return seq_mask
 
 

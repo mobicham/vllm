@@ -219,8 +219,10 @@ def kernel_unified_attention(
     USE_PER_SEQ_CAUSAL: tl.constexpr,  # bool
     per_seq_causal_ptr,  # [num_seqs] bool, or None
     USE_MM_PREFIX: tl.constexpr,  # bool
+    USE_MM_QUERY_RANGE: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,
+    mm_prefix_query_range_ptr,
     rswa_prefix_lens_ptr,
     R_SWA_WINDOW: tl.constexpr,  # int
     USE_R_SWA: tl.constexpr,  # bool
@@ -419,6 +421,9 @@ def kernel_unified_attention(
         MAX_MM_RANGES,
         mm_prefix_range_ptr,
         seq_idx,
+        USE_MM_QUERY_RANGE,
+        mm_prefix_query_range_ptr,
+        cur_batch_in_all_start_index,
     )
 
     # iterate through tiles (now limited to the sliding window range)
@@ -535,6 +540,10 @@ def kernel_unified_attention(
             CHUNK_LOOKBACK,
             CHUNK_SIZE,
             MM_PREFIX_CLAMP_SW,
+            USE_MM_QUERY_RANGE,
+            mm_prefix_query_range_ptr,
+            query_offset_0,
+            query_mask_0,
         )
 
         # S : (BLOCK_M, TILE_SIZE)
@@ -831,8 +840,9 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
-    # Optional tensor for prefix lengths (PrefixLM support)
+    # Optional tensors for PrefixLM / multimodal bidirectional ranges.
     mm_prefix_range=None,
+    mm_prefix_query_range=None,
     # R-SWA support: prefix tokens stay globally visible, generated tokens use
     # a fixed sliding window.
     rswa_prefix_lens=None,
@@ -912,8 +922,17 @@ def unified_attention(
         )
 
     use_mm_prefix = False
+    use_mm_query_range = False
     max_mm_ranges = 0
-    if mm_prefix_range is not None:
+    if mm_prefix_query_range is not None:
+        if mm_prefix_query_range.ndim != 2 or mm_prefix_query_range.shape[1] != 2:
+            raise ValueError(
+                "Unsupported mm_prefix_query_range shape: "
+                f"{mm_prefix_query_range.shape}"
+            )
+        use_mm_prefix = True
+        use_mm_query_range = True
+    elif mm_prefix_range is not None:
         if mm_prefix_range.ndim == 3:
             use_mm_prefix = True
             max_mm_ranges = mm_prefix_range.shape[1]
@@ -943,21 +962,24 @@ def unified_attention(
     launch_num_warps: int | None = None
     launch_num_stages: int | None = None
 
-    # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
-    # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
-    # defaults (BLOCK_Q=8, TILE=32, 4 warps) under-tile it. A wider KV tile +
-    # more query rows per block + 8 warps is ~2x faster on B200.
-    tuned_large_head = (
-        head_size == 256
-        and max_seqlen_q > 1
-        and num_queries_per_kv <= 16
-        and current_platform.is_device_capability_family(100)
+    # head_size 256 with many query rows per sequence is prefill-shaped, but
+    # the decode-oriented defaults (BLOCK_Q=8, TILE=32, 4 warps) under-tile it.
+    # SM100 can sustain a 128-key tile with two stages. SM120 has a smaller
+    # shared-memory limit, where a 64-key tile with one stage is optimal.
+    is_large_head_prefill = (
+        head_size == 256 and max_seqlen_q > 1 and num_queries_per_kv <= 16
     )
-    if tuned_large_head:
+    tuned_large_head_sm100 = is_large_head_prefill and (
+        current_platform.is_device_capability_family(100)
+    )
+    tuned_large_head_sm120 = is_large_head_prefill and (
+        current_platform.is_device_capability_family(120)
+    )
+    if tuned_large_head_sm100 or tuned_large_head_sm120:
         BLOCK_M = 32
         BLOCK_Q = BLOCK_M // num_queries_per_kv
         launch_num_warps = 8
-        launch_num_stages = 2
+        launch_num_stages = 2 if tuned_large_head_sm100 else 1
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
@@ -986,11 +1008,11 @@ def unified_attention(
     TILE_SIZE_DECODE = _get_tile_size(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
-
-    # Wider KV tile for the tuned large-head path (see above). Only the 2D
-    # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
-    if tuned_large_head:
+    # Only the 2D path (max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
+    if tuned_large_head_sm100:
         TILE_SIZE_PREFILL = 128
+    elif tuned_large_head_sm120:
+        TILE_SIZE_PREFILL = 64
 
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile
@@ -1135,8 +1157,10 @@ def unified_attention(
         USE_PER_SEQ_CAUSAL=use_per_seq_causal,
         per_seq_causal_ptr=per_seq_causal_ptr,
         USE_MM_PREFIX=use_mm_prefix,
+        USE_MM_QUERY_RANGE=use_mm_query_range,
         MAX_MM_RANGES=max_mm_ranges,
         mm_prefix_range_ptr=mm_prefix_range,
+        mm_prefix_query_range_ptr=mm_prefix_query_range,
         rswa_prefix_lens_ptr=rswa_prefix_lens if use_rswa else seqused_k,
         R_SWA_WINDOW=rswa_window or 0,
         USE_R_SWA=use_rswa,

@@ -80,6 +80,7 @@ def fill_mm_prefix_query_ranges(
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None,
     query_start_loc_cpu: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
+    is_prefilling_cpu: torch.Tensor | None = None,
 ) -> int:
     """Map each scheduled query token to the mm_prefix range containing it.
 
@@ -102,8 +103,9 @@ def fill_mm_prefix_query_ranges(
     skipped to match the Triton path's ``start < end`` validity check.
 
     ``seq_lens_cpu`` only needs to be exact for prefill rows, since mm_prefix
-    ranges cover prompt tokens: an over-estimate on a decode row shifts that
-    row's query position further past every range, which still matches nothing.
+    ranges cover prompt tokens. When ``is_prefilling_cpu`` is supplied, decode
+    rows are skipped before inspecting their ranges; this avoids repeatedly
+    scanning prompt-only image ranges during generation.
     """
     if mm_prefix_range is None:
         return 0
@@ -121,6 +123,8 @@ def fill_mm_prefix_query_ranges(
     spans: list[tuple[int, int, int, int]] = []
     for req_idx, req_ranges in mm_prefix_range.items():
         if not req_ranges:
+            continue
+        if is_prefilling_cpu is not None and not bool(is_prefilling_cpu[req_idx]):
             continue
         token_start = int(query_start_loc[req_idx])
         query_len = int(query_start_loc[req_idx + 1]) - token_start
